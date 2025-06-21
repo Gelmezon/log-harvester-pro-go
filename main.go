@@ -15,7 +15,6 @@ import (
 	"github.com/ClickHouse/clickhouse-go/v2"
 )
 
-// LogDirConfig 定义日志目录的配置结构体
 type LogDirConfig struct {
 	ServerKey string `json:"serverKey"`
 	Folder    string `json:"folder"`
@@ -63,17 +62,6 @@ func main() {
 	}
 	defer conn.Close()
 
-	// 启动时从 ClickHouse 查询每个日志文件的最大 timestamp
-	clickhouseOffsets := loadOffsetsFromClickHouse(conn, config.LogDirs)
-	fmt.Printf("Loaded ClickHouse offsets: %+v\n", clickhouseOffsets)
-
-	// 加载本地偏移量（可选）
-	processedFiles, err := loadOffsets("offsets.json")
-	fmt.Printf("Loaded processed files: %+v\n", processedFiles)
-	if err != nil {
-		fmt.Printf("Failed to load offsets: %v\n", err)
-	}
-
 	// 日志正则表达式
 	logRegex := regexp.MustCompile(`(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) \[.*?\] (\w+) (.*)`)
 
@@ -81,27 +69,9 @@ func main() {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	// 定期清理偏移量
-	go func() {
-		for range time.Tick(1 * time.Hour) {
-			cleanupOffsets(processedFiles, 7*24*time.Hour)
-			if err := saveOffsets(processedFiles, "offsets.json"); err != nil {
-				fmt.Printf("Failed to save offsets: %v\n", err)
-			}
-		}
-	}()
-	fmt.Printf("Starting periodic cleanup of offsets...\n")
-
-	for {
-		select {
-		// 每5秒处理一次日志 集中把日志处理逻辑放在这里
-		case <-ticker.C:
-			if err := processAndInsertLogs(config.LogDirs, logRegex, processedFiles, clickhouseOffsets, conn); err != nil {
-				fmt.Printf("Error processing logs: %v\n", err)
-			}
-			if err := saveOffsets(processedFiles, "offsets.json"); err != nil {
-				fmt.Printf("Failed to save offsets: %v\n", err)
-			}
+	for range ticker.C {
+		if err := processAndInsertLogs(config.LogDirs, logRegex, conn); err != nil {
+			fmt.Printf("Error processing logs: %v\n", err)
 		}
 	}
 }
@@ -120,112 +90,48 @@ func loadConfig(path string) (Config, error) {
 	return config, nil
 }
 
-// 加载偏移量
-func loadOffsets(path string) (map[string]int64, error) {
-	processedFiles := make(map[string]int64)
-	data, err := os.ReadFile(path)
-	if err != nil && !os.IsNotExist(err) {
-		return processedFiles, err
-	}
-	if len(data) > 0 {
-		if err := json.Unmarshal(data, &processedFiles); err != nil {
-			return processedFiles, err
-		}
-	}
-	return processedFiles, nil
-}
-
-// 保存偏移量
-func saveOffsets(processedFiles map[string]int64, path string) error {
-	data, err := json.Marshal(processedFiles)
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, data, 0644)
-}
-
-// 清理过期偏移量
-func cleanupOffsets(processedFiles map[string]int64, maxAge time.Duration) {
-	for filePath := range processedFiles {
-		if info, err := os.Stat(filePath); err == nil && time.Since(info.ModTime()) > maxAge {
-			delete(processedFiles, filePath)
-		}
-	}
-}
-
-// 启动时从 ClickHouse 查询每个日志文件的最大 timestamp
-func loadOffsetsFromClickHouse(conn clickhouse.Conn, logDirs []LogDirConfig) map[string]time.Time {
-	offsets := make(map[string]time.Time)
+// 查询 ClickHouse 获取每个 serverKey+console.log 的最大时间戳
+func getMaxTimestamp(conn clickhouse.Conn, serverKey, filePath string) (time.Time, error) {
 	ctx := context.Background()
-	for _, dirCfg := range logDirs {
-		serverKey := dirCfg.ServerKey
-		query := `
-            SELECT filePath, max(timestamp)
-            FROM logs
-            WHERE serverKey = ?
-            GROUP BY filePath
-        `
-		rows, err := conn.Query(ctx, query, serverKey)
-		if err != nil {
-			fmt.Printf("ClickHouse query error: %v\n", err)
-			continue
-		}
-		for rows.Next() {
-			var filePath string
-			var maxTime time.Time
-			if err := rows.Scan(&filePath, &maxTime); err == nil {
-				offsets[serverKey+"|"+filePath] = maxTime
-			}
-		}
+	var maxTime time.Time
+	err := conn.QueryRow(ctx,
+		"SELECT max(timestamp) FROM logs WHERE serverKey=? AND filePath=?",
+		serverKey, filePath,
+	).Scan(&maxTime)
+	if err != nil {
+		return time.Time{}, err
 	}
-	return offsets
+	return maxTime, nil
 }
 
 // 处理多个日志文件夹并插入 ClickHouse
 func processAndInsertLogs(
 	logDirs []LogDirConfig,
 	regex *regexp.Regexp,
-	processedFiles map[string]int64,
-	clickhouseOffsets map[string]time.Time,
 	conn clickhouse.Conn,
 ) error {
-	// 创建日志通道和完成信号
 	logChan := make(chan LogEntry, 1000)
-	// 用于通知生产者完成
 	done := make(chan struct{})
-	// 错误通道
 	errChan := make(chan error, 1)
 
-	// 打印开始处理日志的消息
-	fmt.Printf("Starting log processing...\n")
+	go produceLogEntries(logDirs, regex, conn, logChan, done, errChan)
 
-	// 启动生产者
-	go produceLogEntries(logDirs, regex, processedFiles, clickhouseOffsets, logChan, done, errChan)
-
-	// 消费者：批量插入
 	batchSize := 10000
 	var batch []LogEntry
 	var insertedCount int
-	// 处理日志通道中的日志条目
-	// 设置超时时间为50秒
 	timeout := time.After(50 * time.Second)
 
-	// 等待日志条目并批量插入到 ClickHouse
 	for {
 		select {
 		case entry, ok := <-logChan:
 			if !ok {
 				if len(batch) > 0 {
-					// 如果还有剩余的日志条目，进行最后一次批量插入
 					if err := batchInsert(conn, batch); err != nil {
-						// 如果批量插入失败，记录失败的日志
 						logFailedBatch(batch, err)
 						return fmt.Errorf("final batch insert error: %v", err)
 					}
-					// 打印插入的日志条目数量
 					insertedCount += len(batch)
 				}
-				// 打印总共插入的日志条目数量
 				fmt.Printf("Inserted %d log entries\n", insertedCount)
 				return nil
 			}
@@ -268,142 +174,86 @@ func processAndInsertLogs(
 	}
 }
 
-// 并行读取日志文件
+// 只采集 console.log 并用最大时间戳断点续传
 func produceLogEntries(
 	logDirs []LogDirConfig,
 	regex *regexp.Regexp,
-	processedFiles map[string]int64,
-	clickhouseOffsets map[string]time.Time,
+	conn clickhouse.Conn,
 	logChan chan<- LogEntry,
 	done chan<- struct{},
 	errChan chan<- error,
 ) {
 	defer close(done)
-	fmt.Printf("Starting log file processing...\n")
-
-	// 使用 WaitGroup 和信号量来限制并发数
 	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, 4)
 
-	// 正则表达式匹配错误日志和信息日志
-	// 这里假设错误日志格式为 error.2023-10-01.log，信息日志格式为 info.2023-10-01
-	errorPattern := regexp.MustCompile(`^error\.\d{4}-\d{2}-\d{2}\.log$`)
-	infoPattern := regexp.MustCompile(`^info\.\d{4}-\d{2}-\d{2}$`)
-
-	// 遍历每个日志目录
 	for _, dirCfg := range logDirs {
-		dir := dirCfg.Folder
-		serverKey := dirCfg.ServerKey
+		wg.Add(1)
+		go func(dirCfg LogDirConfig) {
+			defer wg.Done()
+			dir := dirCfg.Folder
+			serverKey := dirCfg.ServerKey
+			filePath := filepath.Join(dir, "console.log")
 
-		files, err := os.ReadDir(dir)
-		if err != nil {
-			errChan <- fmt.Errorf("error reading dir %s: %v", dir, err)
-			return
-		}
-		fmt.Printf("Processing directory: %s\n", dir)
-		// log 每一个文件
-		fmt.Printf("Found %d files in directory %s\n", len(files), dir)
-		if len(files) == 0 {
-			fmt.Printf("No files found in directory %s\n", dir)
-			continue
-		}
-
-		for _, file := range files {
-			if file.IsDir() {
-				continue
+			// 查询 ClickHouse 获取最大时间戳
+			maxTimestamp, err := getMaxTimestamp(conn, serverKey, filePath)
+			if err != nil {
+				errChan <- fmt.Errorf("error querying max timestamp for %s: %v", filePath, err)
+				return
 			}
-			fileName := file.Name()
-			filePath := filepath.Join(dir, fileName)
 
-			if fileName == "console.log" ||
-				errorPattern.MatchString(fileName) ||
-				infoPattern.MatchString(fileName) {
+			f, err := os.Open(filePath)
+			if err != nil {
+				fmt.Printf("Error opening file %s: %v\n", filePath, err)
+				return
+			}
+			defer f.Close()
 
-				info, err := file.Info()
-				if err == nil && time.Since(info.ModTime()) > 7*24*time.Hour {
-					continue
-				}
-				// 限制并发数
-				wg.Add(1)
-				semaphore <- struct{}{}
-				go func(filePath, fileName, serverKey string) {
-					defer wg.Done()
-					defer func() { <-semaphore }()
-
-					offset, exists := processedFiles[filePath]
-					if !exists {
-						offset = 0
-					}
-
-					f, err := os.Open(filePath)
-					if err != nil {
-						fmt.Printf("Error opening file %s: %v\n", filePath, err)
-						return
-					}
-					defer f.Close()
-
-					if _, err := f.Seek(offset, 0); err != nil {
-						fmt.Printf("Error seeking file %s: %v\n", filePath, err)
-						return
-					}
-
-					scanner := bufio.NewScanner(f)
-					scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-					var buffer []string
-					for scanner.Scan() {
-						line := scanner.Text()
-						if regex.MatchString(line) {
-							if len(buffer) > 0 {
-								processLogLine(strings.Join(buffer, "\n"), regex, logChan, filePath, processedFiles, serverKey, clickhouseOffsets)
-								buffer = buffer[:0]
-							}
-							buffer = append(buffer, line)
-						} else if len(buffer) > 0 {
-							buffer = append(buffer, line)
-						}
-					}
+			scanner := bufio.NewScanner(f)
+			scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
+			var buffer []string
+			for scanner.Scan() {
+				line := scanner.Text()
+				if regex.MatchString(line) {
 					if len(buffer) > 0 {
-						processLogLine(strings.Join(buffer, "\n"), regex, logChan, filePath, processedFiles, serverKey, clickhouseOffsets)
+						processLogLine(strings.Join(buffer, "\n"), regex, logChan, filePath, serverKey, maxTimestamp)
+						buffer = buffer[:0]
 					}
-
-					newOffset, _ := f.Seek(0, 1)
-					processedFiles[filePath] = newOffset
-				}(filePath, fileName, serverKey)
+					buffer = append(buffer, line)
+				} else if len(buffer) > 0 {
+					buffer = append(buffer, line)
+				}
 			}
-		}
+			if len(buffer) > 0 {
+				processLogLine(strings.Join(buffer, "\n"), regex, logChan, filePath, serverKey, maxTimestamp)
+			}
+		}(dirCfg)
 	}
 
 	wg.Wait()
 	close(logChan)
 }
 
-// 处理单条日志（含多行）
+// 处理单条日志（含多行），只采集大于最大时间戳的日志
 func processLogLine(
 	line string,
 	regex *regexp.Regexp,
 	logChan chan<- LogEntry,
 	filePath string,
-	processedFiles map[string]int64,
 	serverKey string,
-	clickhouseOffsets map[string]time.Time,
+	maxTimestamp time.Time,
 ) {
 	matches := regex.FindStringSubmatch(line)
 	if len(matches) != 4 {
 		return
 	}
-
 	t, err := time.Parse("2006-01-02 15:04:05", matches[1])
 	if err != nil {
 		fmt.Printf("Error parsing timestamp in %s: %v\n", line, err)
 		return
 	}
-
-	// 跳过已同步过的日志
-	offsetKey := serverKey + "|" + filePath
-	if maxT, ok := clickhouseOffsets[offsetKey]; ok && !t.After(maxT) {
+	if !t.After(maxTimestamp) {
 		return
 	}
-
 	logChan <- LogEntry{
 		ID:        uint64(t.UnixNano()),
 		Timestamp: t,
@@ -412,8 +262,6 @@ func processLogLine(
 		ServerKey: serverKey,
 		FilePath:  filePath,
 	}
-
-	processedFiles[filePath] += int64(len([]byte(line)) + 1)
 }
 
 // 批量插入到 ClickHouse，带重试
